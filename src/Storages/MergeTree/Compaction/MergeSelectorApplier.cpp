@@ -84,7 +84,7 @@ MergeSelectorChoices tryChooseTTLMerge(const ChooseContext & ctx)
     /// Delete rows - 2 priority
     if (!ctx.merge_constraints.empty() && !ctx.merge_tree_settings[MergeTreeSetting::ttl_only_drop_parts])
     {
-        TTLRowDeleteMergeSelector delete_ttl_selector(ctx.next_delete_times, ctx.current_time);
+        TTLRowDeleteMergeSelector delete_ttl_selector(ctx.next_delete_times, ctx.current_time, ctx.merge_tree_settings[MergeTreeSetting::max_parts_to_merge_at_once]);
 
         if (auto merge_ranges = delete_ttl_selector.select(ctx.ranges, ctx.merge_constraints, ctx.range_filter); !merge_ranges.empty())
             return pack(ctx, std::move(merge_ranges), MergeType::TTLDelete);

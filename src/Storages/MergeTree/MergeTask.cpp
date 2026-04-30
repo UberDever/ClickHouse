@@ -9,8 +9,8 @@
 #include <fmt/format.h>
 
 #include <Compression/CompressedWriteBuffer.h>
-#include <Core/Settings.h>
 #include <Core/ServerSettings.h>
+#include <Core/Settings.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
 #include <Disks/SingleDiskVolume.h>
@@ -36,11 +36,11 @@
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/TemporaryFiles.h>
 #include <Processors/QueryPlan/UnionStep.h>
+#include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/FilterTransform.h>
 #include <Processors/Transforms/MaterializingTransform.h>
 #include <Processors/Transforms/TTLDeleteFilterTransform.h>
 #include <Processors/Transforms/TTLTransform.h>
-#include <Processors/Transforms/ExpressionTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/MergeTree/FutureMergedMutatedPart.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
@@ -48,6 +48,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularity.h>
+#include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/TextIndexUtils.h>
@@ -147,6 +148,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool materialize_statistics_on_merge;
     extern const MergeTreeSettingsBool propagate_types_serialization_versions_to_nested_types;
     extern const MergeTreeSettingsMergeTreeMapSerializationVersion map_serialization_version;
+    extern const MergeTreeSettingsBool remove_empty_parts;
 }
 
 namespace ErrorCodes
@@ -591,6 +593,22 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         ctx->need_remove_expired_values = false;
     }
 
+    /// Short-circuit for pure TTL-drop merge: skip reading and create an empty output part directly.
+    /// This happens when we have a TTLDrop merge and we're allowed to keep empty parts.
+    bool is_ttl_drop_merge = global_ctx->future_part->merge_type == MergeType::TTLDrop && ctx->need_remove_expired_values;
+
+    /// Only short-circuit if we are allowed to keep empty parts.
+    /// If remove_empty_parts is true, we should let the normal merge process handle it
+    /// (or we need a different mechanism to drop the parts entirely without creating an empty one).
+    bool keep_empty_parts = !(*global_ctx->data->getSettings())[MergeTreeSetting::remove_empty_parts];
+
+    ctx->use_short_circuit_for_ttl_drop = is_ttl_drop_merge && keep_empty_parts;
+
+    if (ctx->use_short_circuit_for_ttl_drop)
+    {
+        LOG_DEBUG(ctx->log, "Short-circuiting TTL-drop merge (creating empty part)");
+    }
+
     const auto & patch_parts = global_ctx->future_part->patch_parts;
 
     /// Determine columns that are absent in all source parts—either fully expired or never written—and mark them as
@@ -898,30 +916,55 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         && !use_const_adaptive_granularity
         && global_ctx->chosen_merge_algorithm == MergeAlgorithm::Vertical;
 
-    /// Merged stream will be created and available as merged_stream variable
-    createMergedStream();
+    if (ctx->use_short_circuit_for_ttl_drop)
+    {
+        // global_ctx->new_data_part is already allocated above with beginTransaction()
+        // called on its storage. No data will be written; finalizePart() will produce
+        // an empty part through the normal MergeProjectionsStage path.
+        auto index_granularity_ptr = std::make_shared<MergeTreeIndexGranularityAdaptive>();
 
-    auto index_granularity_ptr = createMergeTreeIndexGranularity(
-        ctx->sum_input_rows_upper_bound,
-        ctx->sum_uncompressed_bytes_upper_bound,
-        *merge_tree_settings,
-        global_ctx->new_data_part->index_granularity_info,
-        ctx->blocks_are_granules_size);
+        global_ctx->to = std::make_shared<MergedBlockOutputStream>(
+            global_ctx->new_data_part,
+            merge_tree_settings,
+            global_ctx->metadata_snapshot,
+            global_ctx->merging_columns,
+            MergeTreeIndexFactory::instance().getMany(global_ctx->merging_skip_indexes),
+            global_ctx->compression_codec,
+            std::move(index_granularity_ptr),
+            global_ctx->txn ? global_ctx->txn->tid : Tx::NonTransactionalTID,
+            global_ctx->merge_list_element_ptr->total_size_bytes_compressed,
+            /*reset_columns=*/true,
+            ctx->blocks_are_granules_size,
+            global_ctx->context->getWriteSettings(),
+            &global_ctx->written_offset_substreams);
+    }
+    else
+    {
+        /// Merged stream will be created and available as merged_stream variable.
+        createMergedStream();
 
-    global_ctx->to = std::make_shared<MergedBlockOutputStream>(
-        global_ctx->new_data_part,
-        merge_tree_settings,
-        global_ctx->metadata_snapshot,
-        global_ctx->merging_columns,
-        MergeTreeIndexFactory::instance().getMany(global_ctx->merging_skip_indexes),
-        global_ctx->compression_codec,
-        std::move(index_granularity_ptr),
-        global_ctx->txn ? global_ctx->txn->tid : Tx::NonTransactionalTID,
-        global_ctx->merge_list_element_ptr->total_size_bytes_compressed,
-        /*reset_columns=*/true,
-        ctx->blocks_are_granules_size,
-        global_ctx->context->getWriteSettings(),
-        &global_ctx->written_offset_substreams);
+        auto index_granularity_ptr = createMergeTreeIndexGranularity(
+            ctx->sum_input_rows_upper_bound,
+            ctx->sum_uncompressed_bytes_upper_bound,
+            *merge_tree_settings,
+            global_ctx->new_data_part->index_granularity_info,
+            ctx->blocks_are_granules_size);
+
+        global_ctx->to = std::make_shared<MergedBlockOutputStream>(
+            global_ctx->new_data_part,
+            merge_tree_settings,
+            global_ctx->metadata_snapshot,
+            global_ctx->merging_columns,
+            MergeTreeIndexFactory::instance().getMany(global_ctx->merging_skip_indexes),
+            global_ctx->compression_codec,
+            std::move(index_granularity_ptr),
+            global_ctx->txn ? global_ctx->txn->tid : Tx::NonTransactionalTID,
+            global_ctx->merge_list_element_ptr->total_size_bytes_compressed,
+            /*reset_columns=*/true,
+            ctx->blocks_are_granules_size,
+            global_ctx->context->getWriteSettings(),
+            &global_ctx->written_offset_substreams);
+    }
 
     global_ctx->rows_written = 0;
     ctx->initial_reservation = global_ctx->space_reservation ? global_ctx->space_reservation->getSize() : 0;
@@ -1309,6 +1352,13 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeMergeProjections() cons
 
 bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl() const
 {
+    /// Short-circuit: for pure TTL-drop merge, skip the merge loop entirely and jump straight to finalize()
+    if (ctx->use_short_circuit_for_ttl_drop)
+    {
+        finalize();
+        return false;
+    }
+
     Stopwatch watch(CLOCK_MONOTONIC_COARSE);
     UInt64 step_time_ms
         = (*global_ctx->data_settings)[MergeTreeSetting::background_task_preferred_step_execution_time_ms].totalMilliseconds();
@@ -1385,8 +1435,13 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalize() const
     mergeBuiltStatistics(std::move(ctx->build_statistics_transforms), global_ctx);
     finalizeProjections();
     global_ctx->to->finalizeIndexGranularity();
-    global_ctx->merging_executor.reset();
-    global_ctx->merged_pipeline.reset();
+
+    /// Only reset executor and pipeline if they were created (not in short-circuit case)
+    if (global_ctx->merging_executor)
+        global_ctx->merging_executor.reset();
+    if (global_ctx->merged_pipeline.initialized())
+        global_ctx->merged_pipeline.reset();
+
     ctx->build_statistics_transforms.clear();
 
     global_ctx->checkOperationIsNotCanceled();

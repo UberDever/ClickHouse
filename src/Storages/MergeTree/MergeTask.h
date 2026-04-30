@@ -305,6 +305,7 @@ private:
     {
         bool need_remove_expired_values{false};
         bool force_ttl{false};
+        bool use_short_circuit_for_ttl_drop{false};
         std::shared_ptr<RowsSourcesTemporaryFile> rows_sources_temporary_file;
         std::optional<ColumnSizeEstimator> column_sizes{};
 
@@ -328,6 +329,7 @@ private:
         size_t sum_compressed_bytes_upper_bound{0};
         size_t sum_uncompressed_bytes_upper_bound{0};
         bool blocks_are_granules_size{false};
+
 
         LoggerPtr log{getLogger("MergeTask::PrepareStage")};
 

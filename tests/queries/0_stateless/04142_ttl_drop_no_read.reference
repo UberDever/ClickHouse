@@ -1,0 +1,1 @@
+-- Checking that TTLDropMerge did not read any bytes	OK - no bytes read during TTLDropMerge

@@ -82,7 +82,8 @@ private:
 class TTLRowDeleteMergeSelector : public ITTLMergeSelector
 {
 public:
-    explicit TTLRowDeleteMergeSelector(const PartitionIdToTTLs & merge_due_times_, time_t current_time_);
+    explicit TTLRowDeleteMergeSelector(
+        const PartitionIdToTTLs & merge_due_times_, time_t current_time_, size_t max_parts_to_merge_at_once_ = 0);
 
 private:
     time_t getTTLForPart(const PartProperties & part) const override;
