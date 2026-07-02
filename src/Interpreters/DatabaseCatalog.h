@@ -34,11 +34,13 @@ class Exception;
 class ColumnsDescription;
 struct ConstraintsDescription;
 class IDisk;
+class StoragePolicySelector;
 
 using DatabasePtr = std::shared_ptr<IDatabase>;
 using DatabaseAndTable = std::pair<DatabasePtr, StoragePtr>;
 using Databases = std::map<String, std::shared_ptr<IDatabase>, std::less<>>;
 using DiskPtr = std::shared_ptr<IDisk>;
+using StoragePolicySelectorPtr = std::shared_ptr<const StoragePolicySelector>;
 using TableNamesSet = std::unordered_set<QualifiedTableName>;
 
 
@@ -273,6 +275,7 @@ public:
     }
 
     void triggerReloadDisksTask(const Strings & new_added_disks);
+    void prepareNewDisksOnConfigChange(const StoragePolicySelectorPtr & new_storage_policy_selector, const Strings & new_added_disks);
 
     void stopReplicatedDDLQueries();
     void startReplicatedDDLQueries();

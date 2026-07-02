@@ -22,23 +22,73 @@ def started_cluster():
 
 
 def test_storage_policy_configuration_change(started_cluster):
-    node.query(
-        "CREATE TABLE a (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS storage_policy = 'test_policy'"
-    )
+    try:
+        node.query(
+            "CREATE TABLE a (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS storage_policy = 'test_policy'"
+        )
 
+        node.stop_clickhouse()
+        node.copy_file_to_container(
+            os.path.join(CONFIG_DIR, "disk2_only.xml"),
+            "/etc/clickhouse-server/config.d/disks.xml",
+        )
+        node.start_clickhouse()
+    finally:
+        node.stop_clickhouse()
+        node.copy_file_to_container(
+            os.path.join(CONFIG_DIR, "disks.xml"),
+            "/etc/clickhouse-server/config.d/disks.xml",
+        )
+        node.start_clickhouse()
+        node.query("DROP TABLE IF EXISTS a")
+
+
+def test_storage_policy_configuration_change_rejects_existing_disk_contents(started_cluster):
     node.stop_clickhouse()
     node.copy_file_to_container(
-        os.path.join(CONFIG_DIR, "disk2_only.xml"),
+        os.path.join(CONFIG_DIR, "disk1_only.xml"),
         "/etc/clickhouse-server/config.d/disks.xml",
     )
     node.start_clickhouse()
 
-    node.stop_clickhouse()
-    node.copy_file_to_container(
-        os.path.join(CONFIG_DIR, "disks.xml"),
-        "/etc/clickhouse-server/config.d/disks.xml",
-    )
-    node.start_clickhouse()
+    table_name = "test_config_reload_existing_disk_contents"
+    disk2_data_path = None
+    try:
+        node.query(
+            f"CREATE TABLE {table_name} (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS storage_policy = 'test_policy'"
+        )
+        node.query(f"INSERT INTO {table_name} VALUES (1)")
+
+        disk1_path = "/var/lib/clickhouse1/"
+        data_path = node.query(
+            f"SELECT data_paths[1] FROM system.tables WHERE database = currentDatabase() AND name = '{table_name}'"
+        ).strip()
+        disk2_data_path = f"/var/lib/clickhouse2/{data_path.removeprefix(disk1_path)}"
+        node.exec_in_container(
+            ["bash", "-c", f"mkdir -p {shlex.quote(disk2_data_path)}/all_0_0_0"]
+        )
+
+        node.copy_file_to_container(
+            os.path.join(CONFIG_DIR, "disks.xml"),
+            "/etc/clickhouse-server/config.d/disks.xml",
+        )
+        node.query("SYSTEM RELOAD CONFIG")
+
+        assert (
+            node.query(
+                "SELECT max(has(disks, 'disk2')) FROM system.storage_policies WHERE policy_name = 'test_policy'"
+            )
+            == "0\n"
+        )
+    finally:
+        node.query(f"DROP TABLE IF EXISTS {table_name}")
+        if disk2_data_path:
+            node.exec_in_container(["bash", "-c", f"rm -rf {shlex.quote(disk2_data_path)}"])
+        node.copy_file_to_container(
+            os.path.join(CONFIG_DIR, "disks.xml"),
+            "/etc/clickhouse-server/config.d/disks.xml",
+        )
+        node.query("SYSTEM RELOAD CONFIG")
 
 
 def test_alter_storage_policy_with_existing_disk_contents(started_cluster):
